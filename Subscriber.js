@@ -2,46 +2,25 @@ import React from 'react';
 import { sendConnectionLog } from './api/connectionLog';
 import { mapNtfyToNotification } from './utils/ntfyMapper';
 
+// ============================================================
+// CONSTANTS
+// ============================================================
 const MAX_RECONNECT_ATTEMPTS = 3;
 const FLUSH_INTERVAL_MS = 200;
 const LOG_THROTTLE_MS = 10000;
+const RECONNECT_MAX_DELAY_MS = 30000;
 
-// === ntfy error code katalogu ===
-const NTFY_PERMANENT_CODES = new Set([
-  40101, // unauthorized
-  40301, // forbidden (ACL)
-  40401, // page not found
-  40009, // invalid topic
-  40010, // topic disallowed
-  40008, // invalid since
-]);
-
-const NTFY_TRANSIENT_CODES = new Set([
-  42901, // rate limit: too many requests
-  42903, // too many active subscriptions
-  42909, // too many auth failures
-  50001, 50002, 50003, 50004, // 5xx
-]);
-
-const NTFY_CODE_MESSAGES = {
-  40008: 'Geçersiz since parametresi',
-  40009: 'Geçersiz topic adı',
-  40010: 'Topic adına izin verilmiyor',
-  40101: 'Yetkilendirme gerekli (token/credentials)',
-  40301: 'Topic için erişim yetkisi yok (ACL)',
-  40401: 'Endpoint bulunamadı',
-  42901: 'Rate limit aşıldı',
-  42903: 'Aktif subscription limiti aşıldı',
-  42909: 'Çok fazla auth hatası — geçici blok',
-  50001: 'ntfy sunucu hatası',
-  50003: 'ntfy sunucusunda base-url eksik',
-};
-
+// ============================================================
+// COMPONENT
+// ============================================================
 class NotificationSubscriber extends React.Component {
+  // ----------------------------------------------------------
+  // STATE — sadece render'ı etkileyenler
+  // ----------------------------------------------------------
   state = {
     resolvedTopic: this.props.topic || null,
     connection: {
-      status: 'idle',
+      status: 'idle',  // idle | connecting | connected | error | failed
       topic: null,
       error: null,
       attempt: 0,
@@ -50,22 +29,48 @@ class NotificationSubscriber extends React.Component {
     notifications: [],
   };
 
+  // ----------------------------------------------------------
+  // INSTANCE FIELDS — render tetiklemez, hızlı erişim
+  // ----------------------------------------------------------
+  // Connection
   esRef = null;
-  sseBuffer = [];
-  flushTimer = null;
+  esGeneration = 0;        // her yeni connection için artar, zombi guard
+
+  // Timers
   reconnectTimer = null;
+  flushTimer = null;
+
+  // Counters & timestamps
   reconnectAttempt = 0;
+  lastOpenTs = null;
+  lastMessageTs = null;
+  messagesReceivedCount = 0;
+
+  // Log throttling
   lastErrorLogTs = 0;
   errorLogInFlight = false;
-  isStopped = false;
-  preflightAbort = null;
 
-  // ============================================================
+  // Buffers
+  sseBuffer = [];
+
+  // Lifecycle guards
+  isUnmounted = false;     // setState'leri korur
+  isStopped = false;       // reconnect'i durdurur
+
+  // Optional network listeners
+  onlineListener = null;
+  offlineListener = null;
+
+  // ----------------------------------------------------------
   // LIFECYCLE
-  // ============================================================
+  // ----------------------------------------------------------
   componentDidMount() {
+    this.isUnmounted = false;
     this.isStopped = false;
-    if (this.state.resolvedTopic) this.startSSE();
+    this.attachNetworkListeners();
+    if (this.state.resolvedTopic) {
+      this.startSSE();
+    }
   }
 
   static getDerivedStateFromProps(props, state) {
@@ -83,284 +88,317 @@ class NotificationSubscriber extends React.Component {
   }
 
   componentWillUnmount() {
+    // SIRA ÖNEMLİ — önce flag'leri set et, sonra cleanup
+    this.isUnmounted = true;
     this.isStopped = true;
+
     this.stopSSE();
+    this.detachNetworkListeners();
+
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
+
+    // sseBuffer'ı boşalt, GC için
+    this.sseBuffer = [];
   }
 
-  // ============================================================
-  // URL BUILDERS
-  // ============================================================
-  getBaseUrl = () => {
+  // ----------------------------------------------------------
+  // NETWORK LISTENERS
+  // ----------------------------------------------------------
+  attachNetworkListeners = () => {
+    this.onlineListener = () => {
+      // Online olunca elimizde failed/error varsa hemen tekrar dene
+      const status = this.state.connection.status;
+      if ((status === 'error' || status === 'failed') && !this.isStopped) {
+        this.reconnectAttempt = 0;
+        this.startSSE();
+      }
+    };
+    this.offlineListener = () => {
+      this.safeSendConnectionLog('418', 'Client gitti offline', {
+        operation: 'subscribe',
+        phase: 'client_offline',
+        topic: this.state.resolvedTopic,
+      });
+    };
+    window.addEventListener('online', this.onlineListener);
+    window.addEventListener('offline', this.offlineListener);
+  };
+
+  detachNetworkListeners = () => {
+    if (this.onlineListener) {
+      window.removeEventListener('online', this.onlineListener);
+      this.onlineListener = null;
+    }
+    if (this.offlineListener) {
+      window.removeEventListener('offline', this.offlineListener);
+      this.offlineListener = null;
+    }
+  };
+
+  // ----------------------------------------------------------
+  // URL BUILDER
+  // ----------------------------------------------------------
+  buildSseUrl = (topic) => {
     const { hostname, protocol } = window.location;
     const isLocal =
       hostname === 'localhost' ||
       hostname === '127.0.0.1' ||
       hostname.startsWith('192.168.') ||
       hostname.endsWith('.local');
-    return isLocal
-      ? 'http://localhost:9393'
-      : `${protocol}//${hostname}`;
+    if (isLocal) {
+      return `http://localhost:9393/${topic}/sse`;
+    }
+    return `${protocol}//${hostname}/${topic}/sse`;
   };
 
-  buildSseUrl = (topic) => `${this.getBaseUrl()}/${topic}/sse`;
-  buildPreflightUrl = (topic) =>
-    `${this.getBaseUrl()}/${topic}/json?poll=1&since=1s`;
+  // ----------------------------------------------------------
+  // SAFE setState — unmount sonrası setState yapma
+  // ----------------------------------------------------------
+  safeSetState = (updater) => {
+    if (this.isUnmounted) return;
+    this.setState(updater);
+  };
 
-  // ============================================================
-  // CONNECTION LOG
-  // ============================================================
+  // ----------------------------------------------------------
+  // CONNECTION LOG (rate-limited, guarded)
+  // ----------------------------------------------------------
   safeSendConnectionLog = (statusCode, message, meta = {}, force = false) => {
     const now = Date.now();
     if (!force && now - this.lastErrorLogTs < LOG_THROTTLE_MS) return;
-    if (this.errorLogInFlight && !force) return;
+    if (!force && this.errorLogInFlight) return;
 
     this.lastErrorLogTs = now;
     this.errorLogInFlight = true;
 
+    const enrichedMeta = {
+      ...meta,
+      online: navigator.onLine,
+      visibilityState: document.visibilityState,
+      userAgent: navigator.userAgent,
+      pageUrl: window.location.pathname,
+      timestamp: new Date().toISOString(),
+    };
+
     try {
-      Promise.resolve(sendConnectionLog(statusCode, message, meta))
-        .catch((logErr) =>
-          console.error('Connection log gönderilemedi:', logErr)
-        )
+      Promise.resolve(sendConnectionLog(statusCode, message, enrichedMeta))
+        .catch((logErr) => {
+          // Sessizce yut — sonsuz döngü engellemek için
+          // eslint-disable-next-line no-console
+          console.error('Connection log gönderilemedi:', logErr);
+        })
         .finally(() => {
           this.errorLogInFlight = false;
         });
     } catch (logErr) {
       this.errorLogInFlight = false;
+      // eslint-disable-next-line no-console
       console.error('Connection log gönderilemedi:', logErr);
     }
   };
 
-  // ============================================================
-  // PREFLIGHT — ntfy'nin gerçek error kodunu al
-  // ============================================================
-  preflightCheck = async (topic) => {
-    this.preflightAbort = new AbortController();
-    const url = this.buildPreflightUrl(topic);
-
-    try {
-      const res = await fetch(url, {
-        signal: this.preflightAbort.signal,
-        // Auth gerekirse:
-        // headers: { Authorization: `Bearer ${this.props.authToken}` },
-      });
-
-      if (res.ok) {
-        return { ok: true };
-      }
-
-      // ntfy 4xx/5xx body'sini parse et
-      let ntfyError = null;
-      try {
-        ntfyError = await res.json();
-      } catch (_) {
-        // Body JSON değil (proxy hatası vs.)
-      }
-
-      const code = ntfyError?.code;
-      const isPermanent = code && NTFY_PERMANENT_CODES.has(code);
-      const isTransient = code && NTFY_TRANSIENT_CODES.has(code);
-
-      return {
-        ok: false,
-        httpStatus: res.status,
-        ntfyCode: code,
-        ntfyError: ntfyError?.error,
-        ntfyLink: ntfyError?.link,
-        isPermanent,
-        isTransient,
-        friendlyMessage:
-          (code && NTFY_CODE_MESSAGES[code]) ||
-          ntfyError?.error ||
-          `HTTP ${res.status}`,
-      };
-    } catch (netErr) {
-      if (netErr.name === 'AbortError') {
-        return { ok: false, aborted: true };
-      }
-      return {
-        ok: false,
-        networkError: true,
-        errorMessage: netErr.message,
-        friendlyMessage: 'Ağ hatası — ntfy sunucusuna ulaşılamıyor',
-      };
-    } finally {
-      this.preflightAbort = null;
-    }
-  };
-
-  // ============================================================
-  // STOP
-  // ============================================================
+  // ----------------------------------------------------------
+  // STOP — clean teardown (idempotent)
+  // ----------------------------------------------------------
   stopSSE = () => {
+    // Reconnect timer'ı iptal et
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    if (this.preflightAbort) {
-      try { this.preflightAbort.abort(); } catch (_) {}
-      this.preflightAbort = null;
-    }
+
+    // EventSource'u temizle
     if (this.esRef) {
-      try {
-        this.esRef.onopen = null;
-        this.esRef.onmessage = null;
-        this.esRef.onerror = null;
-        this.esRef.close();
-      } catch (_) {}
+      const es = this.esRef;
       this.esRef = null;
+      try {
+        // ÖNCE handler'ları unbind et, SONRA close —
+        // close son bir error event tetiklemesin
+        es.onopen = null;
+        es.onmessage = null;
+        es.onerror = null;
+        es.close();
+      } catch (_) {
+        // ignore
+      }
     }
   };
 
-  // ============================================================
-  // START
-  // ============================================================
-  startSSE = async () => {
+  // ----------------------------------------------------------
+  // START — yeni connection aç (idempotent)
+  // ----------------------------------------------------------
+  startSSE = () => {
+    // Her zaman önce eskisini temizle — LEAK FIX
     this.stopSSE();
-    if (this.isStopped) return;
 
-    const { resolvedTopic } = this.state;
-    if (!resolvedTopic) return;
+    // Kapatma sinyali geldiyse açma
+    if (this.isStopped || this.isUnmounted) return;
 
-    this.setState({
+    const topic = this.state.resolvedTopic;
+    if (!topic) return;
+
+    // Her yeni EventSource için generation artır
+    // Zombi event guard'ı için kullanılır
+    this.esGeneration += 1;
+    const myGeneration = this.esGeneration;
+
+    this.safeSetState({
       connection: {
         status: 'connecting',
-        topic: resolvedTopic,
+        topic,
         error: null,
         attempt: this.reconnectAttempt,
         ts: Date.now(),
       },
     });
 
-    // === 1) PREFLIGHT: ntfy gerçek hata kodunu al ===
-    const preflight = await this.preflightCheck(resolvedTopic);
-    if (this.isStopped) return;
-    if (preflight.aborted) return;
-
-    if (!preflight.ok) {
-      // Hatayı detaylı logla
-      this.safeSendConnectionLog(
-        String(preflight.httpStatus || 599),
-        `ntfy preflight failed: ${preflight.friendlyMessage}`,
-        {
-          topic: resolvedTopic,
-          httpStatus: preflight.httpStatus,
-          ntfyCode: preflight.ntfyCode,
-          ntfyError: preflight.ntfyError,
-          isPermanent: preflight.isPermanent,
-          isTransient: preflight.isTransient,
-          online: navigator.onLine,
-        },
-        true // force log (permanent errors throttle'a takılmasın)
-      );
-
-      // Kalıcı hata → retry yapma, failed state'e geç
-      if (preflight.isPermanent) {
-        this.setState({
-          connection: {
-            status: 'failed',
-            topic: resolvedTopic,
-            error: {
-              reason: 'permanent_ntfy_error',
-              ntfyCode: preflight.ntfyCode,
-              message: preflight.friendlyMessage,
-              link: preflight.ntfyLink,
-            },
-            attempt: this.reconnectAttempt,
-            ts: Date.now(),
-          },
-        });
-        return;
-      }
-
-      // Geçici hata veya network → backoff retry
-      this.setState({
-        connection: {
-          status: 'error',
-          topic: resolvedTopic,
-          error: {
-            ntfyCode: preflight.ntfyCode,
-            message: preflight.friendlyMessage,
-            httpStatus: preflight.httpStatus,
-          },
-          attempt: this.reconnectAttempt,
-          ts: Date.now(),
-        },
-      });
-      this.scheduleReconnect();
-      return;
-    }
-
-    // === 2) Preflight OK → EventSource aç ===
-    const sseUrl = this.buildSseUrl(resolvedTopic);
+    const url = this.buildSseUrl(topic);
     let es;
     try {
-      es = new EventSource(sseUrl, { withCredentials: false });
+      es = new EventSource(url, { withCredentials: false });
     } catch (initErr) {
-      this.safeSendConnectionLog('500', 'EventSource init failed', {
-        topic: resolvedTopic,
-        error: initErr.message,
-      });
+      this.safeSendConnectionLog(
+        '500',
+        `EventSource init hatası: ${initErr.message}`,
+        {
+          operation: 'subscribe',
+          phase: 'init',
+          topic,
+        },
+        true
+      );
       this.scheduleReconnect();
       return;
     }
     this.esRef = es;
 
+    // ----- onopen -----
     es.onopen = () => {
-      if (es !== this.esRef) return;
+      // Zombi guard: aynı generation mı?
+      if (
+        this.isUnmounted ||
+        this.esRef !== es ||
+        this.esGeneration !== myGeneration
+      ) {
+        return;
+      }
+
+      const now = Date.now();
+      this.lastOpenTs = now;
+      this.lastMessageTs = now;
+      this.messagesReceivedCount = 0;
       this.reconnectAttempt = 0;
-      this.lastErrorLogTs = 0;
-      this.setState({
+      this.lastErrorLogTs = 0; // başarılı bağlantıda throttle reset
+
+      this.safeSetState({
         connection: {
           status: 'connected',
-          topic: resolvedTopic,
+          topic,
           error: null,
           attempt: 0,
-          ts: Date.now(),
+          ts: now,
         },
       });
+
       this.safeSendConnectionLog('200', 'SSE bağlantısı başarılı', {
-        topic: resolvedTopic,
+        operation: 'subscribe',
+        phase: 'open',
+        topic,
+        attempt: 0,
       });
     };
 
+    // ----- onmessage -----
     es.onmessage = (e) => {
-      if (es !== this.esRef) return;
+      if (
+        this.isUnmounted ||
+        this.esRef !== es ||
+        this.esGeneration !== myGeneration
+      ) {
+        return;
+      }
+
+      this.lastMessageTs = Date.now();
+      this.messagesReceivedCount += 1;
+
       try {
         const d = JSON.parse(e.data);
-        if (d.event && d.event !== 'message') return;
+        if (d.event && d.event !== 'message') return; // keepalive/open
         this.sseBuffer.push(mapNtfyToNotification(d));
         this.scheduleFlush();
       } catch (err) {
-        console.error('SSE parse error', err, e.data);
+        // eslint-disable-next-line no-console
+        console.error('SSE parse error', err);
+        this.safeSendConnectionLog(
+          '422',
+          'SSE message parse error',
+          {
+            operation: 'subscribe',
+            phase: 'parse',
+            topic,
+            errorMessage: err.message,
+          }
+        );
       }
     };
 
+    // ----- onerror -----
     es.onerror = () => {
-      if (es !== this.esRef) return;
-      const readyState = es.readyState;
+      // Zombi guard
+      if (
+        this.isUnmounted ||
+        this.esRef !== es ||
+        this.esGeneration !== myGeneration
+      ) {
+        return;
+      }
 
-      this.setState({
+      const readyState = es.readyState;
+      const now = Date.now();
+      const connectionDurationMs = this.lastOpenTs
+        ? now - this.lastOpenTs
+        : null;
+      const timeSinceLastMessageMs = this.lastMessageTs
+        ? now - this.lastMessageTs
+        : null;
+
+      this.safeSetState({
         connection: {
           status: 'error',
-          topic: resolvedTopic,
-          error: { readyState, online: navigator.onLine },
+          topic,
+          error: {
+            readyState,
+            online: navigator.onLine,
+            connectionDurationMs,
+          },
           attempt: this.reconnectAttempt,
-          ts: Date.now(),
+          ts: now,
         },
       });
 
+      // Anlamlı context'le logla
+      const statusCode =
+        readyState === EventSource.CLOSED ? '503' : '502';
+
       this.safeSendConnectionLog(
-        '502',
-        `SSE bağlantı koptu (readyState=${readyState})`,
-        { topic: resolvedTopic, readyState, online: navigator.onLine }
+        statusCode,
+        `SSE disconnect (readyState=${readyState})`,
+        {
+          operation: 'subscribe',
+          phase: 'sse_runtime',
+          topic,
+          readyState,
+          connectionDurationMs,
+          timeSinceLastMessageMs,
+          messagesReceived: this.messagesReceivedCount,
+          attempt: this.reconnectAttempt,
+        }
       );
 
-      // Stream sırasında bağlantı koptu → tekrar dene (preflight'tan başla)
+      // Tamamen kapandıysa manuel reconnect
+      // (CONNECTING=0 ise EventSource zaten kendi auto-reconnect'ini yapar)
       if (readyState === EventSource.CLOSED) {
         this.stopSSE();
         this.scheduleReconnect();
@@ -368,15 +406,16 @@ class NotificationSubscriber extends React.Component {
     };
   };
 
-  // ============================================================
-  // RECONNECT (capped)
-  // ============================================================
+  // ----------------------------------------------------------
+  // RECONNECT (capped, exponential backoff)
+  // ----------------------------------------------------------
   scheduleReconnect = () => {
-    if (this.isStopped) return;
-    if (this.reconnectTimer) return;
+    if (this.isStopped || this.isUnmounted) return;
+    if (this.reconnectTimer) return; // zaten zamanlanmış
 
+    // Limit kontrolü
     if (this.reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
-      this.setState({
+      this.safeSetState({
         connection: {
           status: 'failed',
           topic: this.state.resolvedTopic,
@@ -385,47 +424,66 @@ class NotificationSubscriber extends React.Component {
           ts: Date.now(),
         },
       });
+
+      // "Pes ettim" log'u — throttle'a takılmasın
       this.safeSendConnectionLog(
-        '503',
+        '504',
         `SSE giving up after ${MAX_RECONNECT_ATTEMPTS} attempts`,
-        { topic: this.state.resolvedTopic, attempts: this.reconnectAttempt },
+        {
+          operation: 'subscribe',
+          phase: 'give_up',
+          topic: this.state.resolvedTopic,
+          attempts: this.reconnectAttempt,
+        },
         true
       );
       return;
     }
 
     this.reconnectAttempt += 1;
-    const delay = Math.min(1000 * 2 ** this.reconnectAttempt, 30000);
+    const delay = Math.min(
+      1000 * 2 ** this.reconnectAttempt,
+      RECONNECT_MAX_DELAY_MS
+    );
+
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.startSSE();
     }, delay);
   };
 
+  // ----------------------------------------------------------
+  // MANUAL RECONNECT (UI butonu)
+  // ----------------------------------------------------------
   manualReconnect = () => {
+    if (this.isUnmounted) return;
     this.reconnectAttempt = 0;
     this.lastErrorLogTs = 0;
     this.startSSE();
   };
 
-  // ============================================================
-  // FLUSH
-  // ============================================================
+  // ----------------------------------------------------------
+  // FLUSH BUFFER → STATE (batched)
+  // ----------------------------------------------------------
   scheduleFlush = () => {
     if (this.flushTimer) return;
+    if (this.isUnmounted) return;
+
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
+      if (this.isUnmounted) return;
       if (this.sseBuffer.length === 0) return;
+
       const batch = this.sseBuffer.splice(0, this.sseBuffer.length);
-      this.setState((prev) => ({
+      this.safeSetState((prev) => ({
         notifications: [...batch, ...prev.notifications],
       }));
     }, FLUSH_INTERVAL_MS);
   };
 
-  // ============================================================
+  // ----------------------------------------------------------
   // RENDER
-  // ============================================================
+  // ----------------------------------------------------------
   render() {
     const { connection, notifications } = this.state;
     const { status, attempt, error } = connection;
@@ -436,33 +494,27 @@ class NotificationSubscriber extends React.Component {
           <span className={`status status-${status}`}>{status}</span>
 
           {status === 'connecting' && attempt > 0 && (
-            <small>Yeniden deneniyor… ({attempt}/{MAX_RECONNECT_ATTEMPTS})</small>
+            <small>
+              Yeniden deneniyor… ({attempt}/{MAX_RECONNECT_ATTEMPTS})
+            </small>
           )}
 
-          {status === 'error' && error?.ntfyCode && (
+          {status === 'error' && error && (
             <small>
-              ntfy-{error.ntfyCode}: {error.message}
+              readyState={error.readyState} · online=
+              {String(error.online)}
+              {error.connectionDurationMs != null && (
+                <> · bağlı kaldı: {Math.round(error.connectionDurationMs / 1000)}s</>
+              )}
             </small>
           )}
 
           {status === 'failed' && (
             <div className="failed-banner">
-              <strong>Bağlantı başarısız</strong>
-              {error?.ntfyCode && (
-                <div>
-                  Hata kodu: <code>{error.ntfyCode}</code> — {error.message}
-                  {error.link && (
-                    <a href={error.link} target="_blank" rel="noreferrer">
-                      Detay
-                    </a>
-                  )}
-                </div>
-              )}
-              {error?.reason === 'max_attempts_reached' && (
-                <div>
-                  {MAX_RECONNECT_ATTEMPTS} deneme başarısız oldu.
-                </div>
-              )}
+              <strong>Bağlantı kurulamadı</strong>
+              <span>
+                {MAX_RECONNECT_ATTEMPTS} deneme başarısız oldu.
+              </span>
               <button onClick={this.manualReconnect} type="button">
                 Yeniden bağlan
               </button>
@@ -470,9 +522,12 @@ class NotificationSubscriber extends React.Component {
           )}
         </div>
 
-        <ul>
+        <ul className="notifications">
           {notifications.map((n) => (
-            <li key={n.id}>{n.title}</li>
+            <li key={n.id}>
+              {n.title && <strong>{n.title}</strong>}
+              <span>{n.message}</span>
+            </li>
           ))}
         </ul>
       </div>
