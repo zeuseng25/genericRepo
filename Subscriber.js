@@ -1,25 +1,55 @@
 import React from 'react';
-import { sendConnectionLog } from './api/connectionLog'; // kendi import'un
-import { mapNtfyToNotification } from './utils/ntfyMapper'; // kendi import'un
+import { sendConnectionLog } from './api/connectionLog';
+import { mapNtfyToNotification } from './utils/ntfyMapper';
+
+const MAX_RECONNECT_ATTEMPTS = 3;
+const FLUSH_INTERVAL_MS = 200;
+const LOG_THROTTLE_MS = 10000;
+
+// === ntfy error code katalogu ===
+const NTFY_PERMANENT_CODES = new Set([
+  40101, // unauthorized
+  40301, // forbidden (ACL)
+  40401, // page not found
+  40009, // invalid topic
+  40010, // topic disallowed
+  40008, // invalid since
+]);
+
+const NTFY_TRANSIENT_CODES = new Set([
+  42901, // rate limit: too many requests
+  42903, // too many active subscriptions
+  42909, // too many auth failures
+  50001, 50002, 50003, 50004, // 5xx
+]);
+
+const NTFY_CODE_MESSAGES = {
+  40008: 'Geçersiz since parametresi',
+  40009: 'Geçersiz topic adı',
+  40010: 'Topic adına izin verilmiyor',
+  40101: 'Yetkilendirme gerekli (token/credentials)',
+  40301: 'Topic için erişim yetkisi yok (ACL)',
+  40401: 'Endpoint bulunamadı',
+  42901: 'Rate limit aşıldı',
+  42903: 'Aktif subscription limiti aşıldı',
+  42909: 'Çok fazla auth hatası — geçici blok',
+  50001: 'ntfy sunucu hatası',
+  50003: 'ntfy sunucusunda base-url eksik',
+};
 
 class NotificationSubscriber extends React.Component {
-  // ============================================================
-  // STATE
-  // ============================================================
   state = {
     resolvedTopic: this.props.topic || null,
     connection: {
-      status: 'idle',     // idle | connecting | connected | error
+      status: 'idle',
       topic: null,
       error: null,
+      attempt: 0,
       ts: null,
     },
     notifications: [],
   };
 
-  // ============================================================
-  // INSTANCE FIELDS (state dışı, render tetiklemez)
-  // ============================================================
   esRef = null;
   sseBuffer = [];
   flushTimer = null;
@@ -28,20 +58,26 @@ class NotificationSubscriber extends React.Component {
   lastErrorLogTs = 0;
   errorLogInFlight = false;
   isStopped = false;
+  preflightAbort = null;
 
   // ============================================================
   // LIFECYCLE
   // ============================================================
   componentDidMount() {
     this.isStopped = false;
-    if (this.state.resolvedTopic) {
-      this.startSSE();
+    if (this.state.resolvedTopic) this.startSSE();
+  }
+
+  static getDerivedStateFromProps(props, state) {
+    if (props.topic !== state.resolvedTopic) {
+      return { resolvedTopic: props.topic };
     }
+    return null;
   }
 
   componentDidUpdate(prevProps, prevState) {
-    // Topic değiştiyse eski bağlantıyı kapat, yenisini aç
     if (prevState.resolvedTopic !== this.state.resolvedTopic) {
+      this.reconnectAttempt = 0;
       this.startSSE();
     }
   }
@@ -56,29 +92,31 @@ class NotificationSubscriber extends React.Component {
   }
 
   // ============================================================
-  // URL BUILDER
+  // URL BUILDERS
   // ============================================================
-  buildSseUrl = (topic) => {
+  getBaseUrl = () => {
     const { hostname, protocol } = window.location;
     const isLocal =
       hostname === 'localhost' ||
       hostname === '127.0.0.1' ||
       hostname.startsWith('192.168.') ||
       hostname.endsWith('.local');
-
-    if (isLocal) {
-      return `http://localhost:9393/${topic}/sse`;
-    }
-    return `${protocol}//${hostname}/${topic}/sse`;
+    return isLocal
+      ? 'http://localhost:9393'
+      : `${protocol}//${hostname}`;
   };
 
+  buildSseUrl = (topic) => `${this.getBaseUrl()}/${topic}/sse`;
+  buildPreflightUrl = (topic) =>
+    `${this.getBaseUrl()}/${topic}/json?poll=1&since=1s`;
+
   // ============================================================
-  // CONNECTION LOG (rate-limited)
+  // CONNECTION LOG
   // ============================================================
-  safeSendConnectionLog = (statusCode, message, meta = {}) => {
+  safeSendConnectionLog = (statusCode, message, meta = {}, force = false) => {
     const now = Date.now();
-    if (now - this.lastErrorLogTs < 10000) return; // 10sn throttle
-    if (this.errorLogInFlight) return;
+    if (!force && now - this.lastErrorLogTs < LOG_THROTTLE_MS) return;
+    if (this.errorLogInFlight && !force) return;
 
     this.lastErrorLogTs = now;
     this.errorLogInFlight = true;
@@ -98,16 +136,77 @@ class NotificationSubscriber extends React.Component {
   };
 
   // ============================================================
-  // STOP (cleanup)
+  // PREFLIGHT — ntfy'nin gerçek error kodunu al
+  // ============================================================
+  preflightCheck = async (topic) => {
+    this.preflightAbort = new AbortController();
+    const url = this.buildPreflightUrl(topic);
+
+    try {
+      const res = await fetch(url, {
+        signal: this.preflightAbort.signal,
+        // Auth gerekirse:
+        // headers: { Authorization: `Bearer ${this.props.authToken}` },
+      });
+
+      if (res.ok) {
+        return { ok: true };
+      }
+
+      // ntfy 4xx/5xx body'sini parse et
+      let ntfyError = null;
+      try {
+        ntfyError = await res.json();
+      } catch (_) {
+        // Body JSON değil (proxy hatası vs.)
+      }
+
+      const code = ntfyError?.code;
+      const isPermanent = code && NTFY_PERMANENT_CODES.has(code);
+      const isTransient = code && NTFY_TRANSIENT_CODES.has(code);
+
+      return {
+        ok: false,
+        httpStatus: res.status,
+        ntfyCode: code,
+        ntfyError: ntfyError?.error,
+        ntfyLink: ntfyError?.link,
+        isPermanent,
+        isTransient,
+        friendlyMessage:
+          (code && NTFY_CODE_MESSAGES[code]) ||
+          ntfyError?.error ||
+          `HTTP ${res.status}`,
+      };
+    } catch (netErr) {
+      if (netErr.name === 'AbortError') {
+        return { ok: false, aborted: true };
+      }
+      return {
+        ok: false,
+        networkError: true,
+        errorMessage: netErr.message,
+        friendlyMessage: 'Ağ hatası — ntfy sunucusuna ulaşılamıyor',
+      };
+    } finally {
+      this.preflightAbort = null;
+    }
+  };
+
+  // ============================================================
+  // STOP
   // ============================================================
   stopSSE = () => {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    if (this.preflightAbort) {
+      try { this.preflightAbort.abort(); } catch (_) {}
+      this.preflightAbort = null;
+    }
     if (this.esRef) {
       try {
-        // Önce handler'ları unbind et ki close son bir error tetiklemesin
         this.esRef.onopen = null;
         this.esRef.onmessage = null;
         this.esRef.onerror = null;
@@ -118,12 +217,10 @@ class NotificationSubscriber extends React.Component {
   };
 
   // ============================================================
-  // START SSE (idempotent — birden fazla çağrılabilir)
+  // START
   // ============================================================
-  startSSE = () => {
-    // 1) Önce eskisini temizle (LEAK FIX)
+  startSSE = async () => {
     this.stopSSE();
-
     if (this.isStopped) return;
 
     const { resolvedTopic } = this.state;
@@ -134,10 +231,71 @@ class NotificationSubscriber extends React.Component {
         status: 'connecting',
         topic: resolvedTopic,
         error: null,
+        attempt: this.reconnectAttempt,
         ts: Date.now(),
       },
     });
 
+    // === 1) PREFLIGHT: ntfy gerçek hata kodunu al ===
+    const preflight = await this.preflightCheck(resolvedTopic);
+    if (this.isStopped) return;
+    if (preflight.aborted) return;
+
+    if (!preflight.ok) {
+      // Hatayı detaylı logla
+      this.safeSendConnectionLog(
+        String(preflight.httpStatus || 599),
+        `ntfy preflight failed: ${preflight.friendlyMessage}`,
+        {
+          topic: resolvedTopic,
+          httpStatus: preflight.httpStatus,
+          ntfyCode: preflight.ntfyCode,
+          ntfyError: preflight.ntfyError,
+          isPermanent: preflight.isPermanent,
+          isTransient: preflight.isTransient,
+          online: navigator.onLine,
+        },
+        true // force log (permanent errors throttle'a takılmasın)
+      );
+
+      // Kalıcı hata → retry yapma, failed state'e geç
+      if (preflight.isPermanent) {
+        this.setState({
+          connection: {
+            status: 'failed',
+            topic: resolvedTopic,
+            error: {
+              reason: 'permanent_ntfy_error',
+              ntfyCode: preflight.ntfyCode,
+              message: preflight.friendlyMessage,
+              link: preflight.ntfyLink,
+            },
+            attempt: this.reconnectAttempt,
+            ts: Date.now(),
+          },
+        });
+        return;
+      }
+
+      // Geçici hata veya network → backoff retry
+      this.setState({
+        connection: {
+          status: 'error',
+          topic: resolvedTopic,
+          error: {
+            ntfyCode: preflight.ntfyCode,
+            message: preflight.friendlyMessage,
+            httpStatus: preflight.httpStatus,
+          },
+          attempt: this.reconnectAttempt,
+          ts: Date.now(),
+        },
+      });
+      this.scheduleReconnect();
+      return;
+    }
+
+    // === 2) Preflight OK → EventSource aç ===
     const sseUrl = this.buildSseUrl(resolvedTopic);
     let es;
     try {
@@ -152,9 +310,8 @@ class NotificationSubscriber extends React.Component {
     }
     this.esRef = es;
 
-    // --- onopen ---
     es.onopen = () => {
-      if (es !== this.esRef) return; // eski instance'tan geç gelen event
+      if (es !== this.esRef) return;
       this.reconnectAttempt = 0;
       this.lastErrorLogTs = 0;
       this.setState({
@@ -162,6 +319,7 @@ class NotificationSubscriber extends React.Component {
           status: 'connected',
           topic: resolvedTopic,
           error: null,
+          attempt: 0,
           ts: Date.now(),
         },
       });
@@ -170,7 +328,6 @@ class NotificationSubscriber extends React.Component {
       });
     };
 
-    // --- onmessage ---
     es.onmessage = (e) => {
       if (es !== this.esRef) return;
       try {
@@ -183,36 +340,27 @@ class NotificationSubscriber extends React.Component {
       }
     };
 
-    // --- onerror ---
     es.onerror = () => {
-      if (es !== this.esRef) return; // zombi connection'ı yoksay
-
-      const readyState = es.readyState; // 0=CONNECTING, 2=CLOSED
+      if (es !== this.esRef) return;
+      const readyState = es.readyState;
 
       this.setState({
         connection: {
           status: 'error',
           topic: resolvedTopic,
-          error: {
-            readyState,
-            online: navigator.onLine,
-          },
+          error: { readyState, online: navigator.onLine },
+          attempt: this.reconnectAttempt,
           ts: Date.now(),
         },
       });
 
       this.safeSendConnectionLog(
         '502',
-        `SSE bağlantı hatası (readyState=${readyState})`,
-        {
-          topic: resolvedTopic,
-          readyState,
-          online: navigator.onLine,
-        }
+        `SSE bağlantı koptu (readyState=${readyState})`,
+        { topic: resolvedTopic, readyState, online: navigator.onLine }
       );
 
-      // Sadece tamamen kapandıysa manuel reconnect
-      // (readyState=0 ise browser zaten kendi auto-reconnect'ini yapıyor)
+      // Stream sırasında bağlantı koptu → tekrar dene (preflight'tan başla)
       if (readyState === EventSource.CLOSED) {
         this.stopSSE();
         this.scheduleReconnect();
@@ -221,23 +369,47 @@ class NotificationSubscriber extends React.Component {
   };
 
   // ============================================================
-  // RECONNECT (exponential backoff)
+  // RECONNECT (capped)
   // ============================================================
   scheduleReconnect = () => {
     if (this.isStopped) return;
-    if (this.reconnectTimer) return; // zaten zamanlanmış
+    if (this.reconnectTimer) return;
+
+    if (this.reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+      this.setState({
+        connection: {
+          status: 'failed',
+          topic: this.state.resolvedTopic,
+          error: { reason: 'max_attempts_reached' },
+          attempt: this.reconnectAttempt,
+          ts: Date.now(),
+        },
+      });
+      this.safeSendConnectionLog(
+        '503',
+        `SSE giving up after ${MAX_RECONNECT_ATTEMPTS} attempts`,
+        { topic: this.state.resolvedTopic, attempts: this.reconnectAttempt },
+        true
+      );
+      return;
+    }
 
     this.reconnectAttempt += 1;
     const delay = Math.min(1000 * 2 ** this.reconnectAttempt, 30000);
-
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.startSSE();
     }, delay);
   };
 
+  manualReconnect = () => {
+    this.reconnectAttempt = 0;
+    this.lastErrorLogTs = 0;
+    this.startSSE();
+  };
+
   // ============================================================
-  // FLUSH (buffer → state, batch)
+  // FLUSH
   // ============================================================
   scheduleFlush = () => {
     if (this.flushTimer) return;
@@ -248,7 +420,7 @@ class NotificationSubscriber extends React.Component {
       this.setState((prev) => ({
         notifications: [...batch, ...prev.notifications],
       }));
-    }, 200); // 200ms throttle
+    }, FLUSH_INTERVAL_MS);
   };
 
   // ============================================================
@@ -256,19 +428,48 @@ class NotificationSubscriber extends React.Component {
   // ============================================================
   render() {
     const { connection, notifications } = this.state;
+    const { status, attempt, error } = connection;
+
     return (
       <div className="notification-subscriber">
         <div className="status-bar">
-          <span className={`status status-${connection.status}`}>
-            {connection.status}
-          </span>
-          {connection.error && (
+          <span className={`status status-${status}`}>{status}</span>
+
+          {status === 'connecting' && attempt > 0 && (
+            <small>Yeniden deneniyor… ({attempt}/{MAX_RECONNECT_ATTEMPTS})</small>
+          )}
+
+          {status === 'error' && error?.ntfyCode && (
             <small>
-              readyState={connection.error.readyState} | online=
-              {String(connection.error.online)}
+              ntfy-{error.ntfyCode}: {error.message}
             </small>
           )}
+
+          {status === 'failed' && (
+            <div className="failed-banner">
+              <strong>Bağlantı başarısız</strong>
+              {error?.ntfyCode && (
+                <div>
+                  Hata kodu: <code>{error.ntfyCode}</code> — {error.message}
+                  {error.link && (
+                    <a href={error.link} target="_blank" rel="noreferrer">
+                      Detay
+                    </a>
+                  )}
+                </div>
+              )}
+              {error?.reason === 'max_attempts_reached' && (
+                <div>
+                  {MAX_RECONNECT_ATTEMPTS} deneme başarısız oldu.
+                </div>
+              )}
+              <button onClick={this.manualReconnect} type="button">
+                Yeniden bağlan
+              </button>
+            </div>
+          )}
         </div>
+
         <ul>
           {notifications.map((n) => (
             <li key={n.id}>{n.title}</li>
