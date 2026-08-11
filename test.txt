@@ -1,4 +1,0 @@
-read -s -p "LiteLLM key: " LK; echo
-MSYS_NO_PATHCONV=1 docker run --rm -e LK="$LK" --entrypoint node \
-  ghcr.io/codeeer/agent-coder-runner:latest \
-  -e "fetch('https://litellm.ai.garanti.com.tr/v1/chat/completions',{method:'POST',headers:{'Authorization':'Bearer '+process.env.LK,'Content-Type':'application/json'},body:JSON.stringify({model:'MODEL_ADI',messages:[{role:'user',content:'merhaba'}],max_tokens:10})}).then(async r=>console.log('HTTP',r.status,(await r.text()).slice(0,400))).catch(e=>console.log('HATA:',e.message))"
