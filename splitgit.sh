@@ -1,6 +1,7 @@
 #!/bin/bash
-# Buyuk bir commit'i, dosyalarini gruplayarak limit altinda birden fazla commit'e boler.
-# Rebase -i kullanmaz: commit'i acar, parcalar, sonraki commit'leri cherry-pick eder.
+# Buyuk bir commit'i limit altinda birden fazla commit'e boler.
+# Working tree'ye dokunmaz: orijinal blob'lari dogrudan kullanir (git plumbing).
+# autocrlf, .gitignore, filemode, buyuk/kucuk harf gibi Windows sorunlarindan etkilenmez.
 # Kullanim: bash split-commit.sh <commit-hash> [limit_mb]
 
 BIG=$1
@@ -16,21 +17,19 @@ BIG=$(git rev-parse --verify -q "$BIG^{commit}") || die "Commit bulunamadi: $1"
 
 # --- On kontroller ---
 branch=$(git symbolic-ref --short -q HEAD) || die "Detached HEAD durumundasin, once branch'e gec."
-gd=$(git rev-parse --git-dir)
-if [ -d "$gd/rebase-merge" ] || [ -d "$gd/rebase-apply" ] || [ -f "$gd/CHERRY_PICK_HEAD" ]; then
-  die "Yarim kalmis rebase/cherry-pick var. Once: git rebase --abort  veya  git cherry-pick --abort"
-fi
-git diff --quiet && git diff --cached --quiet || die "Working tree temiz degil, once commit/stash yap."
 [ "$(git rev-list --parents -n1 "$BIG" | wc -w)" -eq 2 ] || die "Merge veya root commit desteklenmiyor."
 git merge-base --is-ancestor "$BIG" HEAD || die "Commit mevcut branch'in ($branch) history'sinde degil."
 [ -z "$(git rev-list --merges "$BIG"..HEAD)" ] || die "Commit ile HEAD arasinda merge var."
 
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
 # --- Dosya analizi ve gruplama ---
-plan=$(mktemp)
+metas=(); paths=(); groups=(); sizes=()
 group=1; cur=0; too_big=0
 echo "Branch: $branch"
 echo "Commit: $(git log -1 --format='%h %s' "$BIG")"
-while IFS=$'\t' read -r meta path; do
+while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
   sha=$(echo "$meta" | awk '{print $4}')
   if [[ "$sha" =~ ^0+$ ]]; then size=0; else size=$(git cat-file -s "$sha"); fi
   if [ "$size" -gt $LIMIT ]; then
@@ -38,66 +37,76 @@ while IFS=$'\t' read -r meta path; do
   fi
   if [ $cur -gt 0 ] && [ $((cur+size)) -gt $LIMIT ]; then group=$((group+1)); cur=0; fi
   cur=$((cur+size))
-  printf '%s\t%s\t%s\n' "$group" "$size" "$path" >> "$plan"
-done < <(git -c core.quotePath=false diff-tree -r --no-renames --no-commit-id "$BIG")
+  metas+=("$meta"); paths+=("$path"); groups+=("$group"); sizes+=("$size")
+done < <(git diff-tree -r -z --no-renames --no-commit-id "$BIG")
 
 echo "En buyuk dosyalar:"
-sort -t$'\t' -k2 -nr "$plan" | head -10 | awk -F'\t' '{printf "  %6.1f MB  %s\n", $2/1048576, $3}'
-[ $too_big -eq 1 ] && { rm -f "$plan"; die "Limitten buyuk tek dosya var, limiti o dosyanin ustune cek."; }
+for i in "${!paths[@]}"; do printf '%s\t%s\n' "${sizes[$i]}" "${paths[$i]}"; done \
+  | sort -nr | head -10 | awk -F'\t' '{printf "  %6.1f MB  %s\n", $1/1048576, $2}'
+[ $too_big -eq 1 ] && die "Limitten buyuk tek dosya var, limiti o dosyanin ustune cek."
 
 N=$group
-[ $N -le 1 ] && { rm -f "$plan"; echo "Commit zaten limit altinda, bolmeye gerek yok."; pause; exit 0; }
+[ $N -le 1 ] && { echo "Commit zaten limit altinda, bolmeye gerek yok."; pause; exit 0; }
+ORIG=$(git rev-parse HEAD)
 rest=$(git rev-list --count "$BIG"..HEAD)
-echo "Commit $N parcaya bolunecek (limit ${LIMIT_MB} MB), sonrasindaki $rest commit yeniden uygulanacak."
+echo "${#paths[@]} dosya, $N parcaya bolunecek (limit ${LIMIT_MB} MB), sonrasindaki $rest commit yeniden yazilacak."
 pause
 
-# --- Yedek ---
-ORIG=$(git rev-parse HEAD)
-backup="backup/before-split-$(date +%s)"
-git branch "$backup" || die "Yedek branch olusturulamadi"
-echo "Yedek branch: $backup"
-
-# Hata olursa branch'e dokunulmamis halde geri don
-rollback(){
-  git cherry-pick --abort >/dev/null 2>&1
-  git checkout -q -f "$branch"
-  rm -f "$plan"
-  die "$1 (Branch degismedi, yedek: $backup)"
+# Orijinal commit'in author/committer bilgisiyle commit olustur
+make_commit(){  # $1=tree $2=parent $3=kaynak commit $4=mesaj dosyasi
+  GIT_AUTHOR_NAME=$(git log -1 --format=%an "$3") \
+  GIT_AUTHOR_EMAIL=$(git log -1 --format=%ae "$3") \
+  GIT_AUTHOR_DATE=$(git log -1 --format=%ad --date=raw "$3") \
+  GIT_COMMITTER_NAME=$(git log -1 --format=%cn "$3") \
+  GIT_COMMITTER_EMAIL=$(git log -1 --format=%ce "$3") \
+  GIT_COMMITTER_DATE=$(git log -1 --format=%cd --date=raw "$3") \
+  git commit-tree "$1" -p "$2" -F "$4"
 }
 
-# --- Commit'i ac ---
-git checkout -q --detach "$BIG" || rollback "Commit'e gecilemedi"
-git reset -q HEAD~1 || rollback "reset basarisiz"
-
-AUTHOR=$(git log -1 --format='%an <%ae>' "$BIG")
-DATE=$(git log -1 --format='%aD' "$BIG")
-MSG=$(git log -1 --format='%B' "$BIG")
+# --- Parcalari gecici bir index uzerinde olustur ---
+export GIT_INDEX_FILE="$tmp/index"
+git read-tree "$BIG^" || die "read-tree basarisiz"
+parent=$(git rev-parse "$BIG^")
 
 for ((g=1; g<=N; g++)); do
-  while IFS=$'\t' read -r grp size path; do
-    [ "$grp" -eq $g ] && git add -A -- "$path"
-  done < "$plan"
-  git commit -q --author="$AUTHOR" --date="$DATE" -m "$MSG" -m "(part $g/$N)" \
-    || rollback "Parca $g commit edilemedi"
-  echo "  parca $g/$N commit edildi"
+  : > "$tmp/entries"
+  for i in "${!paths[@]}"; do
+    [ "${groups[$i]}" -eq $g ] || continue
+    read -r _ newmode _ newsha status <<< "${metas[$i]}"
+    if [ "${status:0:1}" = "D" ]; then
+      printf '0 %s 0\t%s\0' "$newsha" "${paths[$i]}" >> "$tmp/entries"
+    else
+      printf '%s %s 0\t%s\0' "$newmode" "$newsha" "${paths[$i]}" >> "$tmp/entries"
+    fi
+  done
+  git update-index -z --index-info < "$tmp/entries" || die "Parca $g index'e yazilamadi"
+  tree=$(git write-tree) || die "Parca $g tree olusturulamadi"
+  { git log -1 --format=%B "$BIG"; echo; echo "(part $g/$N)"; } > "$tmp/msg"
+  parent=$(make_commit "$tree" "$parent" "$BIG" "$tmp/msg") || die "Parca $g commit edilemedi"
+  echo "  parca $g/$N  $(git rev-parse --short "$parent")"
 done
-rm -f "$plan"
+unset GIT_INDEX_FILE
 
-git diff --quiet "$BIG" HEAD || rollback "Parcalarin toplami orijinal commit ile uyusmuyor"
+[ "$(git rev-parse "$parent^{tree}")" = "$(git rev-parse "$BIG^{tree}")" ] \
+  || die "Parcalarin toplami orijinal commit ile uyusmuyor (branch degistirilmedi)"
 
-# --- Sonraki commit'leri yeniden uygula ---
-if [ "$rest" -gt 0 ]; then
-  echo "Sonraki $rest commit uygulaniyor..."
-  git cherry-pick --allow-empty --keep-redundant-commits "$BIG..$ORIG" >/dev/null \
-    || rollback "cherry-pick basarisiz"
-fi
+# --- Sonraki commit'leri ayni tree'lerle yeniden yaz ---
+for c in $(git rev-list --reverse "$BIG..$ORIG"); do
+  git log -1 --format=%B "$c" > "$tmp/msg"
+  parent=$(make_commit "$(git rev-parse "$c^{tree}")" "$parent" "$c" "$tmp/msg") \
+    || die "Commit yeniden yazilamadi: $(git log -1 --format='%h %s' "$c")"
+done
 
-git diff --quiet "$ORIG" HEAD || rollback "Son durum orijinalle uyusmuyor"
+[ "$(git rev-parse "$parent^{tree}")" = "$(git rev-parse "$ORIG^{tree}")" ] \
+  || die "Son durum orijinalle uyusmuyor (branch degistirilmedi)"
 
-# --- Branch'i yeni history'ye tasi ---
-git checkout -q -B "$branch" || rollback "Branch guncellenemedi"
+# --- Yedek al ve branch'i tasi ---
+backup="backup/before-split-$(date +%s)"
+git branch "$backup" "$ORIG" || die "Yedek branch olusturulamadi"
+git update-ref -m "split-commit" "refs/heads/$branch" "$parent" "$ORIG" || die "Branch guncellenemedi"
+git update-index -q --refresh >/dev/null 2>&1
 
 echo
-echo "Tamamlandi. Son durum orijinalle birebir ayni."
-echo "Geri almak istersen: git reset --hard $backup"
+echo "Tamamlandi. Son durum orijinalle birebir ayni, working tree'ye dokunulmadi."
+echo "Yedek: $backup   Geri almak icin: git reset --hard $backup"
 pause
