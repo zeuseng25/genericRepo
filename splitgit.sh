@@ -3,6 +3,12 @@
 # Kullanim: ./split-commit.sh <commit-hash> [limit_mb]
 # Sonra split-push.sh ile push et.
 
+for h in $(git rev-list HEAD --not --remotes=origin); do
+  size=$(git diff-tree -r --no-commit-id "$h" | awk '{print $4}' | grep -v '^0*$' \
+    | git cat-file --batch-check='%(objectsize)' | awk '{s+=$1} END{print s+0}')
+  echo "$((size/1024/1024)) MB  $(git log -1 --format='%h  %an  %ad  %s' --date=short "$h")"
+done | sort -n | tail -10
+
 BIG=$1
 LIMIT_MB=${2:-50}
 LIMIT=$((LIMIT_MB*1024*1024))
